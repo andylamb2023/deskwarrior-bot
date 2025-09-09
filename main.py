@@ -1,6 +1,6 @@
 # README — Desk Warrior Bot (50 Stars) — Wellness + Anti‑Cheat + Leaderboard
 
-This is a **Render-ready** MVP of a Telegram bot called **Desk Warrior** — *your office workout mate*.
+This is a **Render-ready** MVP of a Telegram bot called **Desk Warrior** - *your office workout mate*.
 
 - Sends periodic **exercise flashcards** (push-ups, squats, planks, stretches, walk prompts)
 - Mixes in **wellness tips/warnings** (~25% of cards) — hydration, posture, eye‑strain, sedentary risk
