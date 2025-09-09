@@ -50,6 +50,7 @@ def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     u = data["users"].setdefault(str(user_id), {
         "today": {},
         "points_today": 0,
+        "_last_date": today_key(),
     })
     if u.get("_last_date") != today_key():
         u["today"] = {}
@@ -57,10 +58,10 @@ def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
         u["_last_date"] = today_key()
     return u
 
+# Forever-accumulating leaderboard (per chat)
 def lb_add(data: Dict[str, Any], chat_id: int, user_id: int, pts: int):
     chat = data["leaderboards"].setdefault(str(chat_id), {})
-    day = chat.setdefault(today_key(), {})
-    day[str(user_id)] = day.get(str(user_id), 0) + pts
+    chat[str(user_id)] = chat.get(str(user_id), 0) + pts
 
 # ----------------- Cards -----------------
 EXERCISES = [
@@ -96,54 +97,68 @@ async def send_flashcard(target, context: ContextTypes.DEFAULT_TYPE, user_id: in
 
     if card["type"] == "info":
         await target.reply_text(card["text"])
-    else:
-        wait_time = card["amount"] if card["key"] in ["plank", "stretch", "walk"] else max(15, card["amount"] // 2)
-        now = datetime.now(timezone.utc).timestamp()
-        ready_at = now + wait_time
+        return
 
-        text = f"{card['label']} - {card['amount']}\n⏳ {wait_time}s remaining..."
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Waiting...", callback_data="tooearly")]])
+    # Determine enforced wait
+    wait_time = card["amount"] if card["key"] in ["plank", "stretch", "walk"] else max(15, card["amount"] // 2)
+    now = datetime.now(timezone.utc).timestamp()
+    ready_at = now + wait_time
 
-        user["pending"] = {
-            "key": card["key"],
-            "amount": card["amount"],
-            "points": card["points"],
-            "ready_at": ready_at,
-            "consumed": False,
-        }
-        save_data(data)
+    # Store pending
+    user["pending"] = {
+        "key": card["key"],
+        "amount": card["amount"],
+        "points": card["points"],
+        "ready_at": ready_at,
+        "consumed": False,
+    }
+    save_data(data)
 
-        sent = await target.reply_text(text, reply_markup=kb)
+    # Initial message
+    text = f"{card['label']} - {card['amount']}\n⏳ {wait_time}s remaining..."
+    wait_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Waiting...", callback_data="tooearly")]])
+    sent = await target.reply_text(text, reply_markup=wait_kb)
 
-        # Stable countdown with one repeating job
-        async def countdown_tick(ctx):
-            remaining = int(user["pending"]["ready_at"] - datetime.now(timezone.utc).timestamp())
-            if remaining > 0:
-                try:
-                    await ctx.bot.edit_message_text(
-                        chat_id=sent.chat_id,
-                        message_id=sent.message_id,
-                        text=f"{card['label']} - {card['amount']}\n⏳ {remaining}s remaining...",
-                        reply_markup=kb,
-                    )
-                except Exception:
-                    pass
-            else:
-                try:
-                    await ctx.bot.edit_message_text(
-                        chat_id=sent.chat_id,
-                        message_id=sent.message_id,
-                        text=f"{card['label']} - {card['amount']}\n✅ Time’s up! Log your exercise.",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
-                            [InlineKeyboardButton("🔁 New card", callback_data="flashcard")]
-                        ])
-                    )
-                except Exception:
-                    pass
-                ctx.job.schedule_removal()  # stop repeating job
+    # Schedule a single repeating job (robust)
+    # We pass everything needed via job.data to avoid closure issues
+    job_data = {
+        "chat_id": sent.chat_id,
+        "message_id": sent.message_id,
+        "ready_at": ready_at,
+        "label": card["label"],
+        "amount": card["amount"],
+    }
 
-        context.job_queue.run_repeating(countdown_tick, interval=1, first=1)
+    async def countdown_tick(ctx):
+        d = ctx.job.data
+        remaining = int(d["ready_at"] - datetime.now(timezone.utc).timestamp())
+        if remaining > 0:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=d["chat_id"],
+                    message_id=d["message_id"],
+                    text=f"{d['label']} - {d['amount']}\n⏳ {remaining}s remaining...",
+                    reply_markup=wait_kb,
+                )
+            except Exception:
+                pass
+        else:
+            # unlock
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=d["chat_id"],
+                    message_id=d["message_id"],
+                    text=f"{d['label']} - {d['amount']}\n✅ Time’s up! Log your exercise.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Done", callback_data=f"done:{user['pending']['key']}:{user['pending']['amount']}:{user['pending']['points']}")],
+                        [InlineKeyboardButton("🔁 New card", callback_data="flashcard")]
+                    ])
+                )
+            except Exception:
+                pass
+            ctx.job.schedule_removal()
+
+    context.job_queue.run_repeating(countdown_tick, interval=1, first=1, data=job_data)
 
 async def send_summary(target, user_id: int):
     data = load_data()
@@ -157,13 +172,12 @@ async def send_summary(target, user_id: int):
 
 async def send_leaderboard(target, chat_id: int):
     data = load_data()
-    chat = data["leaderboards"].get(str(chat_id), {})
-    today = chat.get(today_key(), {})
-    if not today:
-        await target.reply_text("No scores yet today.")
+    lb = data["leaderboards"].get(str(chat_id), {})
+    if not lb:
+        await target.reply_text("No scores yet.")
         return
-    items = sorted(today.items(), key=lambda kv: kv[1], reverse=True)[:10]
-    lines = ["🏆 Leaderboard:"]
+    items = sorted(lb.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    lines = ["🏆 All-time leaderboard:"]
     for rank, (uid, pts) in enumerate(items, start=1):
         lines.append(f"{rank}. User {uid}: {pts} pts")
     await target.reply_text("\n".join(lines))
@@ -236,21 +250,21 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "tip":
         await tip(update, context)
 
-# ----------------- Payments -----------------
+# ----------------- Payments (tips) -----------------
 async def tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     title = "Support Desk Warrior"
     description = "If this bot helps you, consider leaving a 100⭐ tip!"
     payload = "deskwarrior-tip"
     currency = "XTR"
-    prices = [LabeledPrice("Tip", 100)]  # 100 Stars
+    prices = [LabeledPrice("Tip", 100)]
 
     await context.bot.send_invoice(
         chat_id,
         title,
         description,
         payload,
-        provider_token="",  # Empty for Stars
+        provider_token="",  # Stars
         currency=currency,
         prices=prices,
         start_parameter="tip",
@@ -262,6 +276,10 @@ async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🙏 Thank you for your tip! You’re keeping Desk Warrior alive.")
+
+# ----------------- Error logging (useful on Railway) -----------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception in handler", exc_info=context.error)
 
 # ----------------- Main -----------------
 def main():
@@ -278,6 +296,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_error_handler(on_error)
 
     async def set_commands(application):
         commands = [
