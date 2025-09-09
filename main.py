@@ -10,6 +10,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     LabeledPrice,
+    BotCommand,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -23,7 +24,6 @@ from telegram.ext import (
 
 # ----------------- Config -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 DATA_FILE = "bot_data.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -48,6 +48,7 @@ def today_key() -> str:
 
 def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     u = data["users"].setdefault(str(user_id), {
+        "premium": False,
         "today": {},
         "points_today": 0,
     })
@@ -88,50 +89,24 @@ def pick_card() -> Dict[str, Any]:
     amt = random.randint(lo, hi)
     return {"type": "exercise", "key": ex["key"], "label": ex["label"], "amount": amt, "points": amt}
 
-# ----------------- Payments -----------------
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    title = "Desk Warrior Premium"
-    description = "Unlock premium: custom intervals (30/45/60), extra cards, streaks."
-    payload = "deskwarrior-premium"
-    currency = "XTR"
-    prices = [LabeledPrice("Premium Upgrade", 50)]  # 50 Stars
-
-    await context.bot.send_invoice(
-        chat_id,
-        title,
-        description,
-        payload,
-        provider_token="",  # Empty for Stars
-        currency=currency,
-        prices=prices,
-        start_parameter="buy",
-    )
-
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
-
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-    user["premium"] = True
-    save_data(data)
-    await update.message.reply_text("🎉 Premium unlocked! Use /interval to set reminders.")
-
-
 # ----------------- Handlers -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "Desk Warrior - your office workout mate.\n\n"
+        "💪 Desk Warrior - your office workout mate.\n\n"
         "I send mini workouts and wellness tips to keep you moving.\n\n"
-        "Commands:\n"
-        "/flashcard - get a card now\n"
-        "/summary - today's totals and points\n"
-        "/leaderboard - top scores in this chat\n\n"
         "Disclaimer: Not medical advice."
     )
-    await update.message.reply_text(msg)
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏋️ Flashcard", callback_data="cmd:flashcard"),
+            InlineKeyboardButton("📊 Summary", callback_data="cmd:summary"),
+        ],
+        [
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="cmd:leaderboard"),
+            InlineKeyboardButton("💎 Buy Premium", callback_data="cmd:buy"),
+        ]
+    ])
+    await update.message.reply_text(msg, reply_markup=kb)
 
 async def flashcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
@@ -143,8 +118,8 @@ async def flashcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = f"{card['label']} - {card['amount']}\nTap Done when finished."
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
-            [InlineKeyboardButton("New card", callback_data="newcard")]
+            [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
+            [InlineKeyboardButton("🔁 New card", callback_data="newcard")]
         ])
         user["pending"] = {
             "key": card["key"],
@@ -160,7 +135,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     user = get_user(data, update.effective_user.id)
     totals = user.get("today", {})
-    lines = ["Today's totals:"]
+    lines = ["📊 Today's totals:"]
     for k, v in totals.items():
         lines.append(f"{k}: {v}")
     lines.append(f"Points: {user.get('points_today', 0)}")
@@ -174,7 +149,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No scores yet today.")
         return
     items = sorted(today.items(), key=lambda kv: kv[1], reverse=True)[:10]
-    lines = ["Leaderboard:"]
+    lines = ["🏆 Leaderboard:"]
     for rank, (uid, pts) in enumerate(items, start=1):
         lines.append(f"{rank}. User {uid}: {pts} pts")
     await update.message.reply_text("\n".join(lines))
@@ -192,8 +167,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = f"{card['label']} - {card['amount']}\nTap Done when finished."
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
-                [InlineKeyboardButton("New card", callback_data="newcard")]
+                [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
+                [InlineKeyboardButton("🔁 New card", callback_data="newcard")]
             ])
             user["pending"] = {
                 "key": card["key"],
@@ -215,21 +190,82 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         await query.edit_message_text(f"Logged {amount} {key}. +{pts} pts!")
 
+    if query.data.startswith("cmd:"):
+        cmd = query.data.split(":")[1]
+        if cmd == "flashcard":
+            await flashcard(update, context)
+        elif cmd == "summary":
+            await summary(update, context)
+        elif cmd == "leaderboard":
+            await leaderboard(update, context)
+        elif cmd == "buy":
+            await buy(update, context)
+
+# ----------------- Payments -----------------
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    title = "Desk Warrior Premium"
+    description = "Unlock premium: custom intervals (30/45/60), extra cards, streaks."
+    payload = "deskwarrior-premium"
+    currency = "XTR"
+    prices = [LabeledPrice("Premium Upgrade", 50)]  # 50 Stars
+
+    await context.bot.send_invoice(
+        chat_id,
+        title,
+        description,
+        payload,
+        provider_token="",  # Empty string for Telegram Stars
+        currency=currency,
+        prices=prices,
+        start_parameter="buy",
+    )
+
+async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user = get_user(data, update.effective_user.id)
+    user["premium"] = True
+    save_data(data)
+    await update.message.reply_text("🎉 Premium unlocked! Use /interval to set reminders.")
+
 # ----------------- Main -----------------
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("flashcard", flashcard))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CallbackQueryHandler(button))
-    app.run_polling()
     app.add_handler(CommandHandler("buy", buy))
+
+    # Buttons
+    app.add_handler(CallbackQueryHandler(button))
+
+    # Payments
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
+    # Persistent menu
+    async def set_commands(application):
+        commands = [
+            BotCommand("flashcard", "🏋️ Workout Card"),
+            BotCommand("summary", "📊 Today’s Totals"),
+            BotCommand("leaderboard", "🏆 Leaderboard"),
+            BotCommand("buy", "💎 Premium Upgrade"),
+        ]
+        await application.bot.set_my_commands(commands)
+
+    app.post_init = set_commands
+
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
