@@ -11,6 +11,4 @@ This is a **Render-ready** MVP of a Telegram bot called **Desk Warrior** - *your
 - Offers **premium** via **Telegram Stars (50 XTR)** → custom intervals (30/45/60), more content, streak features (stubbed)
 - Uses **python-telegram-bot v20** and **JobQueue** for per-user reminders
 
-> **Env var:** `8234741363:AAE3jX94uxLhylyBUf0kz1bv0ZyP2zFra8Y` (from @BotFather)
 
----
