@@ -18,7 +18,7 @@ from telegram.ext import (
     ContextTypes,
     PreCheckoutQueryHandler,
     MessageHandler,
-    Filters,
+    filters,
 )
 
 # ----------------- Config -----------------
