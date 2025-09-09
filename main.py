@@ -18,7 +18,7 @@ from telegram.ext import (
     ContextTypes,
     PreCheckoutQueryHandler,
     MessageHandler,
-    filters,
+    Filters,
 )
 
 # ----------------- Config -----------------
@@ -226,6 +226,10 @@ def main():
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CallbackQueryHandler(button))
     app.run_polling()
+    app.add_handler(CommandHandler("buy", buy))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+
 
 if __name__ == "__main__":
     main()
