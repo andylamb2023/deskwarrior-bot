@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import random
+import string
 import asyncio
 from datetime import datetime, date, timezone
 from typing import Dict, Any
@@ -47,16 +48,29 @@ def save_data(data: Dict[str, Any]) -> None:
 def today_key() -> str:
     return date.today().isoformat()
 
-def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+def make_arcade_tag(name: str) -> str:
+    """Make a 3-char arcade style tag from a name or random letters."""
+    if name:
+        tag = ''.join(ch for ch in name.upper() if ch.isalpha())
+        if len(tag) >= 3:
+            return tag[:3]
+        return tag.ljust(3, 'X')
+    return ''.join(random.choice(string.ascii_uppercase) for _ in range(3))
+
+def get_user(data: Dict[str, Any], user_id: int, tg_user=None) -> Dict[str, Any]:
     u = data["users"].setdefault(str(user_id), {
         "today": {},
         "points_today": 0,
         "_last_date": today_key(),
+        "tag": None,
     })
     if u.get("_last_date") != today_key():
         u["today"] = {}
         u["points_today"] = 0
         u["_last_date"] = today_key()
+    if not u.get("tag") and tg_user:
+        display = tg_user.first_name or tg_user.username or ""
+        u["tag"] = make_arcade_tag(display)
     return u
 
 # Forever-accumulating leaderboard
@@ -93,7 +107,7 @@ def pick_card() -> Dict[str, Any]:
 # ----------------- Flashcard helper -----------------
 async def send_flashcard(target, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     data = load_data()
-    user = get_user(data, user_id)
+    user = get_user(data, user_id, target.from_user)
     card = pick_card()
 
     if card["type"] == "info":
@@ -116,7 +130,6 @@ async def send_flashcard(target, context: ContextTypes.DEFAULT_TYPE, user_id: in
     wait_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Waiting...", callback_data="tooearly")]])
     sent = await target.reply_text(f"{card['label']} - {card['amount']}\n⏳ {wait_time}s remaining...", reply_markup=wait_kb)
 
-    # Inline countdown loop
     for r in range(wait_time, 0, -1):
         await asyncio.sleep(1)
         remaining = r - 1
@@ -131,7 +144,6 @@ async def send_flashcard(target, context: ContextTypes.DEFAULT_TYPE, user_id: in
         except Exception:
             pass
 
-    # Unlock
     try:
         await context.bot.edit_message_text(
             chat_id=sent.chat_id,
@@ -148,7 +160,7 @@ async def send_flashcard(target, context: ContextTypes.DEFAULT_TYPE, user_id: in
 # ----------------- Summary & Leaderboard -----------------
 async def send_summary(target, user_id: int):
     data = load_data()
-    user = get_user(data, user_id)
+    user = get_user(data, user_id, target.from_user)
     totals = user.get("today", {})
     lines = ["📊 Today's totals:"]
     for k, v in totals.items():
@@ -165,11 +177,16 @@ async def send_leaderboard(target, chat_id: int):
     items = sorted(lb.items(), key=lambda kv: kv[1], reverse=True)[:10]
     lines = ["🏆 All-time leaderboard:"]
     for rank, (uid, pts) in enumerate(items, start=1):
-        lines.append(f"{rank}. User {uid}: {pts} pts")
+        tag = data["users"].get(uid, {}).get("tag", "???")
+        lines.append(f"{rank}. {tag} — {pts} pts")
     await target.reply_text("\n".join(lines))
 
 # ----------------- Commands -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    get_user(data, update.effective_user.id, update.effective_user)
+    save_data(data)
+
     msg = (
         "💪 Desk Warrior - your office workout mate.\n\n"
         "All features are free to use.\n"
@@ -188,6 +205,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(msg, reply_markup=kb)
 
+async def tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user = get_user(data, update.effective_user.id, update.effective_user)
+
+    if not context.args:
+        await update.message.reply_text("Usage: /tag ABC (choose 3 letters for your initials)")
+        return
+
+    chosen = ''.join(ch for ch in context.args[0].upper() if ch.isalpha())[:3]
+    if len(chosen) < 3:
+        chosen = chosen.ljust(3, 'X')
+
+    user["tag"] = chosen
+    save_data(data)
+    await update.message.reply_text(f"Your arcade tag has been set to: {chosen}")
+
 async def flashcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_flashcard(update.message, context, update.effective_user.id)
 
@@ -202,7 +235,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = load_data()
-    user = get_user(data, query.from_user.id)
+    user = get_user(data, query.from_user.id, query.from_user)
 
     if query.data == "tooearly":
         await query.answer("⏳ Still counting down!", show_alert=True)
@@ -275,6 +308,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("tag", tag))
     app.add_handler(CommandHandler("flashcard", flashcard))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
@@ -289,6 +323,7 @@ def main():
             BotCommand("flashcard", "🏋️ Workout Card"),
             BotCommand("summary", "📊 Today’s Totals"),
             BotCommand("leaderboard", "🏆 Leaderboard"),
+            BotCommand("tag", "🎮 Set your arcade initials"),
             BotCommand("tip", "☕ Tip the Creator (100⭐)"),
         ]
         await application.bot.set_my_commands(commands)
