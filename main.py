@@ -1,9 +1,8 @@
-### `main.py`
-```python
 import os
 import json
 import logging
-from datetime import datetime, timedelta, date, timezone
+import random
+from datetime import datetime, date, timezone
 from typing import Dict, Any
 
 from telegram import (
@@ -35,66 +34,51 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ----------------- Helpers -----------------
-# (helpers unchanged)
+def load_data() -> Dict[str, Any]:
+    if not os.path.exists(DATA_FILE):
+        return {"users": {}, "leaderboards": {}}
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"users": {}, "leaderboards": {}}
 
-# ----------------- Bot Handlers -----------------
+def save_data(data: Dict[str, Any]) -> None:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-DISCLAIMER = (
-    "<i>Disclaimer: This bot provides general wellness prompts only."
-    " Not medical advice. If any movement causes pain, stop. Consult a professional if you have injuries or conditions.</i>"
-)
+def today_key() -> str:
+    return date.today().isoformat()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-    save_data(data)
+def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    u = data["users"].setdefault(str(user_id), {
+        "premium": False,
+        "interval": FREE_INTERVAL_MIN,
+        "today": {},
+        "points_today": 0,
+        "pending": None,
+    })
+    if u.get("_last_date") != today_key():
+        u["today"] = {}
+        u["points_today"] = 0
+        u["_last_date"] = today_key()
+    return u
 
-    msg = (
-        "👋 <b>Desk Warrior</b> - your office workout mate.\n\n"
-        "I’ll ping you with small exercise cards to break up long sitting. I’ll also send occasional wellness tips (hydration, posture, eye‑strain).\n\n"
-        f"Free tier: flashcard every <b>{FREE_INTERVAL_MIN} min</b>.\n"
-        "Upgrade with <b>50 Stars</b> to choose intervals (30/45/60), bigger library, and streaks.\n\n"
-        "Commands:\n"
-        "• /flashcard - get one now\n"
-        "• /summary - today’s totals and points\n"
-        "• /leaderboard - top scores in this chat (today)\n"
-        "• /buy - unlock premium (50 Stars)\n"
-        "• /interval - set reminder interval (premium)\n\n"
-        f"{DISCLAIMER}"
-    )
+def lb_add(data: Dict[str, Any], chat_id: int, user_id: int, pts: int):
+    chat = data["leaderboards"].setdefault(str(chat_id), {})
+    day = chat.setdefault(today_key(), {})
+    day[str(user_id)] = day.get(str(user_id), 0) + pts
 
-    await update.message.reply_html(msg)
-    await ensure_user_job(context, update.effective_chat.id, update.effective_user.id)
+# ----------------- Cards -----------------
+EXERCISES = [
+    {"key": "pushups", "label": "Push-ups", "reps": [8, 15], "sec_per_rep": 1.2, "points_per_rep": 1},
+    {"key": "squats", "label": "Bodyweight squats", "reps": [12, 20], "sec_per_rep": 1.1, "points_per_rep": 1},
+    {"key": "plank", "label": "Plank (seconds)", "reps": [30, 60], "sec_per_rep": 1.0, "points_per_sec": 0.1},
+    {"key": "stretch", "label": "Neck/Shoulder stretch (seconds)", "reps": [30, 45], "sec_per_rep": 1.0, "points_per_sec": 0.05},
+    {"key": "walk", "label": "Brisk walk (minutes)", "reps": [5, 8], "sec_per_min": 60, "points_per_min": 5},
+]
 
-# (rest of code unchanged)
-```
+WELLNESS_CARDS = [
+    {"key": "hydration", "text": "Hydration: Drink a glass of water."},
+    {"key": "sitting", "text": "Sitting too long increases risk of back pain and
 
-### `requirements.txt`
-```text
-python-telegram-bot==20.6
-```
-
----
-
-## Render Deployment (Free)
-
-Same steps - just note your bot is now branded **Desk Warrior**.
-
----
-
-## Quick Test Checklist
-
-- DM your bot → `/start` → should say: **Desk Warrior - your office workout mate**
-- `/flashcard` → exercise or wellness tip
-- `/summary` → totals + points
-- `/leaderboard` → daily top scores
-- `/buy` → 50‑Star invoice
-- `/interval 30` → premium interval
-
----
-
-## Roadmap
-- Streaks + badges
-- Weekly leaderboard
-- Export CSV
-- Persistent storage
