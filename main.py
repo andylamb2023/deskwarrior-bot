@@ -98,12 +98,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🏋️ Flashcard", callback_data="cmd:flashcard"),
-            InlineKeyboardButton("📊 Summary", callback_data="cmd:summary"),
+            InlineKeyboardButton("🏋️ Flashcard", callback_data="cmd_flashcard"),
+            InlineKeyboardButton("📊 Summary", callback_data="cmd_summary"),
         ],
         [
-            InlineKeyboardButton("🏆 Leaderboard", callback_data="cmd:leaderboard"),
-            InlineKeyboardButton("💎 Buy Premium (100⭐)", callback_data="cmd:buy"),
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="cmd_leaderboard"),
+            InlineKeyboardButton("💎 Buy Premium (100⭐)", callback_data="cmd_buy"),
         ]
     ])
     await update.message.reply_text(msg, reply_markup=kb)
@@ -120,9 +120,9 @@ async def flashcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now = datetime.now(timezone.utc).timestamp()
         ready_at = now + wait_time
 
-        text = f"{card['label']} - {card['amount']}\n⏳ Please wait {wait_time}s before pressing Done."
+        text = f"{card['label']} - {card['amount']}\n⏳ Please wait {wait_time}s..."
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"⏳ Wait {wait_time}s", callback_data="tooearly")],
+            [InlineKeyboardButton("⏳ Waiting...", callback_data="tooearly")],
             [InlineKeyboardButton("🔁 New card", callback_data="newcard")]
         ])
 
@@ -134,7 +134,21 @@ async def flashcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "consumed": False,
         }
         save_data(data)
-        await update.message.reply_text(text, reply_markup=kb)
+
+        sent = await update.message.reply_text(text, reply_markup=kb)
+
+        # Schedule auto-swap to Done
+        async def unlock_done():
+            await context.bot.edit_message_reply_markup(
+                chat_id=sent.chat_id,
+                message_id=sent.message_id,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
+                    [InlineKeyboardButton("🔁 New card", callback_data="newcard")]
+                ])
+            )
+
+        context.job_queue.run_once(lambda _: context.application.create_task(unlock_done()), wait_time)
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
@@ -167,7 +181,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(data, query.from_user.id)
 
     if query.data == "tooearly":
-        await query.answer("⏳ Still counting down, wait until timer finishes!", show_alert=True)
+        await query.answer("⏳ Still counting down!", show_alert=True)
         return
 
     if query.data == "newcard":
@@ -181,7 +195,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("No active exercise.")
             return
         if now < pending.get("ready_at", 0):
-            await query.answer("⏳ Too early! Finish the exercise first.", show_alert=True)
+            await query.answer("⏳ Too early! Wait for the bot to unlock Done.", show_alert=True)
             return
 
         _, key, amount, pts = query.data.split(":")
@@ -193,16 +207,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         await query.edit_message_text(f"✅ Logged {amount} {key}. +{pts} pts!")
 
-    if query.data.startswith("cmd:"):
-        cmd = query.data.split(":")[1]
-        if cmd == "flashcard":
-            await flashcard(update, context)
-        elif cmd == "summary":
-            await summary(update, context)
-        elif cmd == "leaderboard":
-            await leaderboard(update, context)
-        elif cmd == "buy":
-            await buy(update, context)
+    if query.data == "cmd_flashcard":
+        await flashcard(update, context)
+    elif query.data == "cmd_summary":
+        await summary(update, context)
+    elif query.data == "cmd_leaderboard":
+        await leaderboard(update, context)
+    elif query.data == "cmd_buy":
+        await buy(update, context)
 
 # ----------------- Payments -----------------
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,4 +277,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
