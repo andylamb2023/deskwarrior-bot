@@ -9,12 +9,16 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    LabeledPrice,
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    PreCheckoutQueryHandler,
+    MessageHandler,
+    filters,
 )
 
 # ----------------- Config -----------------
@@ -83,6 +87,38 @@ def pick_card() -> Dict[str, Any]:
     lo, hi = ex["reps"]
     amt = random.randint(lo, hi)
     return {"type": "exercise", "key": ex["key"], "label": ex["label"], "amount": amt, "points": amt}
+
+# ----------------- Payments -----------------
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    title = "Desk Warrior Premium"
+    description = "Unlock premium: custom intervals (30/45/60), extra cards, streaks."
+    payload = "deskwarrior-premium"
+    currency = "XTR"
+    prices = [LabeledPrice("Premium Upgrade", 50)]  # 50 Stars
+
+    await context.bot.send_invoice(
+        chat_id,
+        title,
+        description,
+        payload,
+        provider_token="",  # Empty for Stars
+        currency=currency,
+        prices=prices,
+        start_parameter="buy",
+    )
+
+async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user = get_user(data, update.effective_user.id)
+    user["premium"] = True
+    save_data(data)
+    await update.message.reply_text("🎉 Premium unlocked! Use /interval to set reminders.")
+
 
 # ----------------- Handlers -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
