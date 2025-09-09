@@ -103,7 +103,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🏆 Leaderboard", callback_data="cmd:leaderboard"),
-            InlineKeyboardButton("💎 Buy Premium", callback_data="cmd:buy"),
+            InlineKeyboardButton("💎 Buy Premium (100⭐)", callback_data="cmd:buy"),
         ]
     ])
     await update.message.reply_text(msg, reply_markup=kb)
@@ -116,16 +116,21 @@ async def flashcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if card["type"] == "info":
         await update.message.reply_text(card["text"])
     else:
-        text = f"{card['label']} - {card['amount']}\nTap Done when finished."
+        wait_time = card["amount"] if card["key"] in ["plank", "stretch", "walk"] else max(15, card["amount"] // 2)
+        now = datetime.now(timezone.utc).timestamp()
+        ready_at = now + wait_time
+
+        text = f"{card['label']} - {card['amount']}\n⏳ Please wait {wait_time}s before pressing Done."
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
+            [InlineKeyboardButton(f"⏳ Wait {wait_time}s", callback_data="tooearly")],
             [InlineKeyboardButton("🔁 New card", callback_data="newcard")]
         ])
+
         user["pending"] = {
             "key": card["key"],
             "amount": card["amount"],
             "points": card["points"],
-            "issued_at": datetime.now(timezone.utc).timestamp(),
+            "ready_at": ready_at,
             "consumed": False,
         }
         save_data(data)
@@ -154,41 +159,39 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{rank}. User {uid}: {pts} pts")
     await update.message.reply_text("\n".join(lines))
 
+# ----------------- Button Handler -----------------
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = load_data()
     user = get_user(data, query.from_user.id)
 
+    if query.data == "tooearly":
+        await query.answer("⏳ Still counting down, wait until timer finishes!", show_alert=True)
+        return
+
     if query.data == "newcard":
-        card = pick_card()
-        if card["type"] == "info":
-            await query.edit_message_text(card["text"])
-        else:
-            text = f"{card['label']} - {card['amount']}\nTap Done when finished."
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
-                [InlineKeyboardButton("🔁 New card", callback_data="newcard")]
-            ])
-            user["pending"] = {
-                "key": card["key"],
-                "amount": card["amount"],
-                "points": card["points"],
-                "issued_at": datetime.now(timezone.utc).timestamp(),
-                "consumed": False,
-            }
-            save_data(data)
-            await query.edit_message_text(text, reply_markup=kb)
+        await flashcard(update, context)
         return
 
     if query.data.startswith("done:"):
+        now = datetime.now(timezone.utc).timestamp()
+        pending = user.get("pending")
+        if not pending or pending.get("consumed"):
+            await query.edit_message_text("No active exercise.")
+            return
+        if now < pending.get("ready_at", 0):
+            await query.answer("⏳ Too early! Finish the exercise first.", show_alert=True)
+            return
+
         _, key, amount, pts = query.data.split(":")
         pts = int(pts)
         user["today"][key] = user["today"].get(key, 0) + int(amount)
         user["points_today"] += pts
+        pending["consumed"] = True
         lb_add(data, query.message.chat_id, query.from_user.id, pts)
         save_data(data)
-        await query.edit_message_text(f"Logged {amount} {key}. +{pts} pts!")
+        await query.edit_message_text(f"✅ Logged {amount} {key}. +{pts} pts!")
 
     if query.data.startswith("cmd:"):
         cmd = query.data.split(":")[1]
@@ -208,14 +211,14 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     description = "Unlock premium: custom intervals (30/45/60), extra cards, streaks."
     payload = "deskwarrior-premium"
     currency = "XTR"
-    prices = [LabeledPrice("Premium Upgrade", 50)]  # 50 Stars
+    prices = [LabeledPrice("Premium Upgrade", 100)]  # 100 Stars
 
     await context.bot.send_invoice(
         chat_id,
         title,
         description,
         payload,
-        provider_token="",  # Empty string for Telegram Stars
+        provider_token="",  # Empty for Stars
         currency=currency,
         prices=prices,
         start_parameter="buy",
@@ -239,33 +242,27 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("flashcard", flashcard))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("buy", buy))
-
-    # Buttons
     app.add_handler(CallbackQueryHandler(button))
-
-    # Payments
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
-    # Persistent menu
     async def set_commands(application):
         commands = [
             BotCommand("flashcard", "🏋️ Workout Card"),
             BotCommand("summary", "📊 Today’s Totals"),
             BotCommand("leaderboard", "🏆 Leaderboard"),
-            BotCommand("buy", "💎 Premium Upgrade"),
+            BotCommand("buy", "💎 Premium Upgrade (100⭐)"),
         ]
         await application.bot.set_my_commands(commands)
 
     app.post_init = set_commands
-
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
