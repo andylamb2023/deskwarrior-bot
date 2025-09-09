@@ -3,7 +3,7 @@
 This is a **Render-ready** MVP of a Telegram bot called **Desk Warrior** - *your office workout mate*.
 
 - Sends periodic **exercise flashcards** (push-ups, squats, planks, stretches, walk prompts)
-- Mixes in **wellness tips/warnings** (~25% of cards) — hydration, posture, eye‑strain, sedentary risk
+- Mixes in **wellness tips/warnings** (~25% of cards) - hydration, posture, eye‑strain, sedentary risk
 - Lets users tap **Done ✅** to log completions (exercise cards only)
 - **Anti‑cheat**: validates realistic completion time; early taps get reduced or rejected
 - Awards **points** and shows a **/leaderboard** (per chat) for friendly competition
@@ -11,7 +11,7 @@ This is a **Render-ready** MVP of a Telegram bot called **Desk Warrior** - *your
 - Offers **premium** via **Telegram Stars (50 XTR)** → custom intervals (30/45/60), more content, streak features (stubbed)
 - Uses **python-telegram-bot v20** and **JobQueue** for per-user reminders
 
-> **Env var:** `BOT_TOKEN` (from @BotFather)
+> **Env var:** `8234741363:AAE3jX94uxLhylyBUf0kz1bv0ZyP2zFra8Y` (from @BotFather)
 
 ---
 
@@ -69,16 +69,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
 
     msg = (
-        "👋 <b>Desk Warrior</b> — your office workout mate.\n\n"
+        "👋 <b>Desk Warrior</b> - your office workout mate.\n\n"
         "I’ll ping you with small exercise cards to break up long sitting. I’ll also send occasional wellness tips (hydration, posture, eye‑strain).\n\n"
         f"Free tier: flashcard every <b>{FREE_INTERVAL_MIN} min</b>.\n"
         "Upgrade with <b>50 Stars</b> to choose intervals (30/45/60), bigger library, and streaks.\n\n"
         "Commands:\n"
-        "• /flashcard — get one now\n"
-        "• /summary — today’s totals and points\n"
-        "• /leaderboard — top scores in this chat (today)\n"
-        "• /buy — unlock premium (50 Stars)\n"
-        "• /interval — set reminder interval (premium)\n\n"
+        "• /flashcard - get one now\n"
+        "• /summary - today’s totals and points\n"
+        "• /leaderboard - top scores in this chat (today)\n"
+        "• /buy - unlock premium (50 Stars)\n"
+        "• /interval - set reminder interval (premium)\n\n"
         f"{DISCLAIMER}"
     )
 
@@ -97,7 +97,7 @@ python-telegram-bot==20.6
 
 ## Render Deployment (Free)
 
-Same steps — just note your bot is now branded **Desk Warrior**.
+Same steps - just note your bot is now branded **Desk Warrior**.
 
 ---
 
