@@ -80,5 +80,8 @@ EXERCISES = [
 
 WELLNESS_CARDS = [
     {"key": "hydration", "text": "Hydration: Drink a glass of water."},
-    {"key": "sitting", "text": "Sitting too long increases risk of back pain and
-
+    {"key": "sitting", "text": "Sitting too long increases risk of back pain and poor circulation. Stand and stretch."},
+    {"key": "posture", "text": "Posture check: ears over shoulders, shoulders down, breathe deep x5."},
+    {"key": "eyes", "text": "20-20-20 rule: Every 20 minutes, look 20 feet away for 20 seconds."},
+    {"key": "breaks", "text": "Micro-break: 60 seconds of movement resets focus."},
+]
