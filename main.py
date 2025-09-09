@@ -84,7 +84,7 @@ Same steps - just note your bot is now branded **Desk Warrior**.
 
 ## Quick Test Checklist
 
-- DM your bot → `/start` → should say: **Desk Warrior — your office workout mate**
+- DM your bot → `/start` → should say: **Desk Warrior - your office workout mate**
 - `/flashcard` → exercise or wellness tip
 - `/summary` → totals + points
 - `/leaderboard` → daily top scores
