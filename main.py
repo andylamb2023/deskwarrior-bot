@@ -115,31 +115,35 @@ async def send_flashcard(target, context: ContextTypes.DEFAULT_TYPE, user_id: in
 
         sent = await target.reply_text(text, reply_markup=kb)
 
-        # Countdown updates
-        for remaining in range(wait_time - 1, 0, -1):
-            await context.job_queue.run_once(
-                lambda ctx, r=remaining: ctx.bot.edit_message_text(
-                    chat_id=sent.chat_id,
-                    message_id=sent.message_id,
-                    text=f"{card['label']} - {card['amount']}\n⏳ {r}s remaining...",
-                    reply_markup=kb,
-                ),
-                when=wait_time - remaining,
-            )
+        # Stable countdown with one repeating job
+        async def countdown_tick(ctx):
+            remaining = int(user["pending"]["ready_at"] - datetime.now(timezone.utc).timestamp())
+            if remaining > 0:
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=sent.chat_id,
+                        message_id=sent.message_id,
+                        text=f"{card['label']} - {card['amount']}\n⏳ {remaining}s remaining...",
+                        reply_markup=kb,
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=sent.chat_id,
+                        message_id=sent.message_id,
+                        text=f"{card['label']} - {card['amount']}\n✅ Time’s up! Log your exercise.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
+                            [InlineKeyboardButton("🔁 New card", callback_data="flashcard")]
+                        ])
+                    )
+                except Exception:
+                    pass
+                ctx.job.schedule_removal()  # stop repeating job
 
-        # Unlock Done at the end
-        async def unlock_done(ctx: ContextTypes.DEFAULT_TYPE):
-            await ctx.bot.edit_message_text(
-                chat_id=sent.chat_id,
-                message_id=sent.message_id,
-                text=f"{card['label']} - {card['amount']}\n✅ Time’s up! Log your exercise.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
-                    [InlineKeyboardButton("🔁 New card", callback_data="flashcard")]
-                ])
-            )
-
-        context.job_queue.run_once(unlock_done, wait_time)
+        context.job_queue.run_repeating(countdown_tick, interval=1, first=1)
 
 async def send_summary(target, user_id: int):
     data = load_data()
