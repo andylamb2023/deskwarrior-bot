@@ -98,12 +98,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🏋️ Flashcard", callback_data="cmd_flashcard"),
-            InlineKeyboardButton("📊 Summary", callback_data="cmd_summary"),
+            InlineKeyboardButton("🏋️ Flashcard", callback_data="flashcard"),
+            InlineKeyboardButton("📊 Summary", callback_data="summary"),
         ],
         [
-            InlineKeyboardButton("🏆 Leaderboard", callback_data="cmd_leaderboard"),
-            InlineKeyboardButton("💎 Buy Premium (100⭐)", callback_data="cmd_buy"),
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard"),
+            InlineKeyboardButton("💎 Buy Premium (100⭐)", callback_data="buy"),
         ]
     ])
     await update.message.reply_text(msg, reply_markup=kb)
@@ -122,8 +122,7 @@ async def flashcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"{card['label']} - {card['amount']}\n⏳ Please wait {wait_time}s..."
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏳ Waiting...", callback_data="tooearly")],
-            [InlineKeyboardButton("🔁 New card", callback_data="newcard")]
+            [InlineKeyboardButton("⏳ Waiting...", callback_data="tooearly")]
         ])
 
         user["pending"] = {
@@ -137,18 +136,18 @@ async def flashcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sent = await update.message.reply_text(text, reply_markup=kb)
 
-        # Schedule auto-swap to Done
-        async def unlock_done():
-            await context.bot.edit_message_reply_markup(
+        # Auto-swap ⏳ → ✅ Done
+        async def unlock_done(ctx: ContextTypes.DEFAULT_TYPE):
+            await ctx.bot.edit_message_reply_markup(
                 chat_id=sent.chat_id,
                 message_id=sent.message_id,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Done", callback_data=f"done:{card['key']}:{card['amount']}:{card['points']}")],
-                    [InlineKeyboardButton("🔁 New card", callback_data="newcard")]
+                    [InlineKeyboardButton("🔁 New card", callback_data="flashcard")]
                 ])
             )
 
-        context.job_queue.run_once(lambda _: context.application.create_task(unlock_done()), wait_time)
+        context.job_queue.run_once(unlock_done, wait_time)
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
@@ -184,10 +183,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⏳ Still counting down!", show_alert=True)
         return
 
-    if query.data == "newcard":
-        await flashcard(update, context)
-        return
-
     if query.data.startswith("done:"):
         now = datetime.now(timezone.utc).timestamp()
         pending = user.get("pending")
@@ -207,13 +202,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         await query.edit_message_text(f"✅ Logged {amount} {key}. +{pts} pts!")
 
-    if query.data == "cmd_flashcard":
+    if query.data == "flashcard":
         await flashcard(update, context)
-    elif query.data == "cmd_summary":
+    elif query.data == "summary":
         await summary(update, context)
-    elif query.data == "cmd_leaderboard":
+    elif query.data == "leaderboard":
         await leaderboard(update, context)
-    elif query.data == "cmd_buy":
+    elif query.data == "buy":
         await buy(update, context)
 
 # ----------------- Payments -----------------
@@ -277,5 +272,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
