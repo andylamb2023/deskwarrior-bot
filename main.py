@@ -2,8 +2,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
 API_TOKEN = "YOUR_TELEGRAM_BOT_API_KEY"
-ADMIN_HANDLE = @thebutchersblock   # who gets pinged
-WALLET_ADDRESS = testaddress
+ADMIN_HANDLE = "@thebutchersblock"   # who gets pinged
+WALLET_ADDRESS = "testaddress"
 
 bot = Bot(token=API_TOKEN, parse_mode="Markdown")
 dp = Dispatcher(bot)
