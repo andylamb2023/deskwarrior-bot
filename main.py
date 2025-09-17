@@ -1,16 +1,37 @@
+# Telegram shop bot:
+# - Region selection (US/UK/EU) + catalogue (EU loads from local XLSX/CSV or CSV URL)
+# - Cart -> checkout -> ask sender wallet + shipping
+# - Save orders in SQLite (status=Pending)
+# - Post order card to ADMIN_GROUP_ID with inline status buttons
+# - Admin: tap buttons or /setstatus; reply to tickets with /reply
+# - /reload_eu to refresh EU list from file/URL
+# - Pagination for large catalogues
+
 import os
+import re
+import csv
 import sqlite3
+from io import StringIO
 from contextlib import closing
-from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
-# =========================
-# Config from ENV
-# =========================
+# Optional deps used conditionally
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    import openpyxl  # for .xlsx reading
+except Exception:
+    openpyxl = None
+
 API_TOKEN = os.getenv("API_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))   # e.g. -1001234567890
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "YOUR_USDT_WALLET")
+EU_PRICELIST_CSV_URL = os.getenv("EU_PRICELIST_CSV_URL")  # optional
+EU_PRICELIST_PATH = os.getenv("EU_PRICELIST_PATH")        # e.g. "eu_pricelist.xlsx" in repo
 
 if not API_TOKEN:
     raise ValueError("API_TOKEN not set")
@@ -21,10 +42,10 @@ bot = Bot(token=API_TOKEN, parse_mode="Markdown")
 dp = Dispatcher(bot)
 
 DB_PATH = "orders.db"
+PAGE_SIZE = 10
+ORDER_STATUSES = {"pending", "paid", "shipped", "delivered", "canceled"}
 
-# =========================
-# DB helpers (SQLite)
-# =========================
+# ---------------- DB ----------------
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         c = conn.cursor()
@@ -33,7 +54,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             region TEXT NOT NULL,
-            products TEXT NOT NULL,   -- comma-separated product ids
+            products TEXT NOT NULL,
             total REAL NOT NULL,
             user_wallet TEXT,
             shipping TEXT,
@@ -77,13 +98,19 @@ def get_user_orders(user_id, limit=5):
         """, (user_id, limit))
         return c.fetchall()
 
+def get_order(order_id):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, user_id, region, products, total, user_wallet, shipping, status, created_at
+            FROM orders WHERE id=?
+        """, (order_id,))
+        return c.fetchone()
+
 def insert_message(user_id, text):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         c = conn.cursor()
-        c.execute("""
-            INSERT INTO messages (user_id, text)
-            VALUES (?, ?)
-        """, (user_id, text))
+        c.execute("INSERT INTO messages (user_id, text) VALUES (?, ?)", (user_id, text))
         return c.lastrowid
 
 def get_message(msg_id):
@@ -95,47 +122,124 @@ def get_message(msg_id):
 def mark_message_replied(msg_id):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         c = conn.cursor()
-        c.execute("""
-            UPDATE messages
-               SET status='closed', replied_at=datetime('now')
-             WHERE id=?
-        """, (msg_id,))
+        c.execute("UPDATE messages SET status='closed', replied_at=datetime('now') WHERE id=?", (msg_id,))
         return c.rowcount
 
-# =========================
-# Catalogue (per region)
-# =========================
+# ------------- Catalogue ------------
 catalogues = {
     "US": {
-        1: {"name": "US Product 1", "price": 10},
-        2: {"name": "US Product 2", "price": 20},
-        3: {"name": "US Product 3", "price": 30},
+        1: {"name": "US Product 1", "price": 10.0},
+        2: {"name": "US Product 2", "price": 20.0},
+        3: {"name": "US Product 3", "price": 30.0},
     },
     "UK": {
-        1: {"name": "UK Product 1", "price": 12},
-        2: {"name": "UK Product 2", "price": 18},
-        3: {"name": "UK Product 3", "price": 28},
+        1: {"name": "UK Product 1", "price": 12.0},
+        2: {"name": "UK Product 2", "price": 18.0},
+        3: {"name": "UK Product 3", "price": 28.0},
     },
-    "EU": {
-        1: {"name": "EU Product 1", "price": 15},
-        2: {"name": "EU Product 2", "price": 25},
-        3: {"name": "EU Product 3", "price": 35},
-    }
+    "EU": {}  # loaded at boot /reload_eu
 }
 
-ORDER_STATUSES = {"pending", "paid", "shipped", "delivered", "canceled"}
+def parse_price(val: str) -> float:
+    v = (val or "").strip().replace(",", ".")
+    v = re.sub(r"[^0-9.]", "", v)
+    try:
+        return round(float(v), 2) if v else 0.0
+    except Exception:
+        return 0.0
 
-# =========================
-# In-memory session state
-# =========================
-user_region = {}   # uid -> "US"/"UK"/"EU"
-carts = {}         # uid -> [product_ids]
-step = {}          # uid -> "awaiting_wallet" | "awaiting_shipping" | "contact_msg"
-temp = {}          # uid -> dict for transient data (subtotal, etc.)
+def load_eu_from_csv_text(text: str) -> int:
+    reader = csv.DictReader(StringIO(text))
+    items = {}
+    next_id = 1
+    for row in reader:
+        name = (row.get("name") or row.get("Name") or "").strip()
+        if not name:
+            continue
+        if "id" in row and str(row["id"]).strip().isdigit():
+            pid = int(str(row["id"]).strip())
+        else:
+            pid = next_id; next_id += 1
+        price = parse_price(row.get("price") or row.get("Price") or "0")
+        items[pid] = {"name": name, "price": price}
+    catalogues["EU"] = dict(sorted(items.items(), key=lambda kv: kv[0]))
+    return len(items)
 
-# =========================
-# UI helpers
-# =========================
+def load_eu_from_local(path: str) -> int:
+    if not os.path.exists(path):
+        return 0
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return load_eu_from_csv_text(f.read())
+    elif ext in (".xlsx", ".xls"):
+        if openpyxl is None:
+            return 0
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        # build header map
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return 0
+        headers = [str(h or "").strip().lower() for h in rows[0]]
+        try:
+            name_idx = headers.index("name")
+        except ValueError:
+            # heuristic: take the first non-empty column as name
+            name_idx = 0
+        price_idx = None
+        for key in ("price", "cost", "amount"):
+            if key in headers:
+                price_idx = headers.index(key); break
+        id_idx = headers.index("id") if "id" in headers else None
+
+        items, next_id = {}, 1
+        for r in rows[1:]:
+            if r is None:
+                continue
+            name = str(r[name_idx]).strip() if name_idx is not None and name_idx < len(r) and r[name_idx] is not None else ""
+            if not name:
+                continue
+            pid = None
+            if id_idx is not None and id_idx < len(r):
+                try:
+                    pid = int(str(r[id_idx]).split(".")[0])
+                except Exception:
+                    pid = None
+            if pid is None:
+                pid = next_id; next_id += 1
+            price_val = ""
+            if price_idx is not None and price_idx < len(r) and r[price_idx] is not None:
+                price_val = str(r[price_idx])
+            price = parse_price(price_val)
+            items[pid] = {"name": name, "price": price}
+        catalogues["EU"] = dict(sorted(items.items(), key=lambda kv: kv[0]))
+        return len(items)
+    else:
+        return 0
+
+def load_eu_catalogue() -> int:
+    # Try local file first (XLSX/CSV), then CSV URL
+    if EU_PRICELIST_PATH:
+        count = load_eu_from_local(EU_PRICELIST_PATH)
+        if count:
+            return count
+    if EU_PRICELIST_CSV_URL and requests:
+        try:
+            resp = requests.get(EU_PRICELIST_CSV_URL, timeout=15)
+            resp.raise_for_status()
+            return load_eu_from_csv_text(resp.text)
+        except Exception:
+            return 0
+    return 0
+
+# ---------- Session State -----------
+user_region = {}
+carts = {}
+step = {}     # awaiting_wallet | awaiting_shipping | contact_msg
+temp = {}     # per-user transient dict
+
+# -------------- UI ------------------
 def main_menu_kb():
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
@@ -148,34 +252,72 @@ def main_menu_kb():
 def region_kb():
     kb = types.InlineKeyboardMarkup(row_width=3)
     kb.add(
-        types.InlineKeyboardButton("🇺🇸 U.S", callback_data="region_US"),
-        types.InlineKeyboardButton("🇬🇧 U.K", callback_data="region_UK"),
-        types.InlineKeyboardButton("🇪🇺 EU", callback_data="region_EU"),
+        types.InlineKeyboardButton("🇺🇸 U.S", callback_data="region_US_1"),
+        types.InlineKeyboardButton("🇬🇧 U.K", callback_data="region_UK_1"),
+        types.InlineKeyboardButton("🇪🇺 EU", callback_data="region_EU_1"),
     )
     return kb
 
-def products_kb(region):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    for pid, info in catalogues[region].items():
-        kb.insert(
-            types.InlineKeyboardButton(
-                f"{pid}. {info['name']} (${info['price']})",
-                callback_data=f"add_{pid}"
-            )
-        )
+def products_kb(region, page: int):
+    items = catalogues.get(region, {})
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    if not items:
+        kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="menu_new"))
+        return kb
+
+    pids = sorted(items.keys())
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_slice = pids[start:end]
+
+    for pid in page_slice:
+        info = items[pid]
+        label = f"{pid}. {info['name']} (${info['price']})"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"add_{pid}"))
+
+    nav = []
+    if start > 0:
+        nav.append(types.InlineKeyboardButton("« Prev", callback_data=f"page_{region}_{page-1}"))
+    if end < len(pids):
+        nav.append(types.InlineKeyboardButton("Next »", callback_data=f"page_{region}_{page+1}"))
+    if nav:
+        kb.row(*nav)
+
     kb.add(types.InlineKeyboardButton("✅ Checkout", callback_data="checkout"))
     kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="menu_new"))
     return kb
 
-# =========================
-# Customer-facing handlers
-# =========================
+def admin_status_kb(order_id):
+    row1 = [
+        types.InlineKeyboardButton("✅ Mark Paid", callback_data=f"st:{order_id}:paid"),
+        types.InlineKeyboardButton("📦 Shipped", callback_data=f"st:{order_id}:shipped"),
+    ]
+    row2 = [
+        types.InlineKeyboardButton("🚚 Delivered", callback_data=f"st:{order_id}:delivered"),
+        types.InlineKeyboardButton("⏳ Pending", callback_data=f"st:{order_id}:pending"),
+    ]
+    row3 = [types.InlineKeyboardButton("🛑 Cancel", callback_data=f"st:{order_id}:canceled")]
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(*row1); kb.row(*row2); kb.row(*row3)
+    return kb
+
+def order_card_text(row):
+    oid, user_id, region, products, total, user_wallet, shipping, status, created_at = row
+    return (
+        f"🧾 *Order* [#{oid}]\n"
+        f"User: `{user_id}`\n"
+        f"Region: {region}\n"
+        f"Items: {products}\n"
+        f"Total: ${total} USDT\n"
+        f"Sender wallet: `{user_wallet}`\n"
+        f"Shipping:\n{shipping}\n\n"
+        f"Current status: *{status}*"
+    )
+
+# ---------- Customer handlers -------
 @dp.message_handler(commands=["start"])
 async def cmd_start(msg: types.Message):
-    await msg.answer(
-        "Welcome. What would you like to do?",
-        reply_markup=main_menu_kb()
-    )
+    await msg.answer("Welcome. What would you like to do?", reply_markup=main_menu_kb())
 
 @dp.callback_query_handler(lambda c: c.data == "menu_new")
 async def menu_new(call: types.CallbackQuery):
@@ -189,15 +331,10 @@ async def menu_status(call: types.CallbackQuery):
     uid = call.from_user.id
     rows = get_user_orders(uid, limit=5)
     if not rows:
-        await call.message.edit_text("No orders found.", reply_markup=main_menu_kb())
-        return
-    lines = []
-    for oid, status, total, region, created in rows:
-        lines.append(f"• **#{oid}** | {status.title()} | ${total} | {region} | {created}")
-    await call.message.edit_text(
-        "Recent orders:\n" + "\n".join(lines),
-        reply_markup=main_menu_kb()
-    )
+        await call.message.edit_text("No orders found.", reply_markup=main_menu_kb()); return
+    lines = [f"• **#{oid}** | {status.title()} | ${total} | {region} | {created}"
+             for (oid, status, total, region, created) in rows]
+    await call.message.edit_text("Recent orders:\n" + "\n".join(lines), reply_markup=main_menu_kb())
 
 @dp.callback_query_handler(lambda c: c.data == "menu_contact")
 async def menu_contact(call: types.CallbackQuery):
@@ -210,12 +347,21 @@ async def menu_contact(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("region_"))
 async def choose_region(call: types.CallbackQuery):
+    # region_<REG>_<PAGE>
+    _, region, page = call.data.split("_")
     uid = call.from_user.id
-    region = call.data.split("_")[1]
     user_region[uid] = region
     await call.message.edit_text(
         f"Selected region: *{region}*\nPick your products:",
-        reply_markup=products_kb(region)
+        reply_markup=products_kb(region, int(page))
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith("page_"))
+async def paginate(call: types.CallbackQuery):
+    _, region, page = call.data.split("_")
+    await call.message.edit_text(
+        f"Selected region: *{region}*\nPick your products:",
+        reply_markup=products_kb(region, int(page))
     )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("add_"))
@@ -223,9 +369,10 @@ async def add_item(call: types.CallbackQuery):
     uid = call.from_user.id
     region = user_region.get(uid)
     if not region:
-        await call.answer("Choose region first", show_alert=True)
-        return
+        await call.answer("Choose region first", show_alert=True); return
     pid = int(call.data.split("_")[1])
+    if pid not in catalogues.get(region, {}):
+        await call.answer("Item not found on this page.", show_alert=True); return
     carts.setdefault(uid, []).append(pid)
     subtotal = sum(catalogues[region][i]["price"] for i in carts[uid])
     await call.answer(f"Added. Subtotal: ${subtotal}")
@@ -236,17 +383,16 @@ async def checkout(call: types.CallbackQuery):
     region = user_region.get(uid)
     cart = carts.get(uid, [])
     if not region or not cart:
-        await call.answer("No items selected.", show_alert=True)
-        return
+        await call.answer("No items selected.", show_alert=True); return
 
     subtotal = sum(catalogues[region][i]["price"] for i in cart)
     items = ", ".join(str(i) for i in cart)
-    temp[uid] = {"region": region, "items": items, "subtotal": subtotal}
+    temp[uid] = {"region": region, "items": items, "subtotal": round(subtotal, 2)}
     step[uid] = "awaiting_wallet"
 
     await call.message.edit_text(
         f"Your order ({region}): {items}\n"
-        f"Total: *${subtotal} USDT*\n\n"
+        f"Total: *${round(subtotal,2)} USDT*\n\n"
         f"Send payment to:\n`{WALLET_ADDRESS}`\n\n"
         "Reply with the *crypto address you will send from*."
     )
@@ -254,31 +400,20 @@ async def checkout(call: types.CallbackQuery):
 @dp.message_handler(lambda m: True, content_types=types.ContentTypes.TEXT)
 async def collect_steps(msg: types.Message):
     uid = msg.from_user.id
-    # Contact-to-team step
+    # Contact Team
     if step.get(uid) == "contact_msg":
         text = msg.text.strip()
         if len(text) < 2:
-            await msg.answer("Please write a bit more.")
-            return
+            await msg.answer("Please write a bit more."); return
         msg_id = insert_message(uid, text)
-        await bot.send_message(
-            ADMIN_GROUP_ID,
-            f"📩 *New Message* [MSG-{msg_id}]\n"
-            f"From user: `{uid}`\n\n"
-            f"\"{text}\""
-        )
+        await bot.send_message(ADMIN_GROUP_ID, f"📩 *New Message* [MSG-{msg_id}]\nFrom user: `{uid}`\n\n\"{text}\"")
         step.pop(uid, None)
         await msg.answer("✅ Message sent. The team will reply here via the bot.", reply_markup=main_menu_kb())
         return
 
     # Order steps
     if step.get(uid) == "awaiting_wallet":
-        # store sender wallet, ask shipping
-        wallet = msg.text.strip()
-        if " " in wallet and not wallet.startswith("@"):
-            # very loose guard, but keep it permissive
-            wallet = wallet.split()[0]
-        temp.setdefault(uid, {})["user_wallet"] = wallet
+        temp.setdefault(uid, {})["user_wallet"] = msg.text.strip()
         step[uid] = "awaiting_shipping"
         await msg.answer("✅ Wallet noted.\nNow send your *shipping address* (one message).")
         return
@@ -286,146 +421,169 @@ async def collect_steps(msg: types.Message):
     if step.get(uid) == "awaiting_shipping":
         shipping = msg.text.strip()
         data = temp.get(uid, {})
-        region = data.get("region")
-        items = data.get("items")
-        subtotal = data.get("subtotal")
-        user_wallet = data.get("user_wallet")
-
+        region = data.get("region"); items = data.get("items")
+        subtotal = data.get("subtotal"); user_wallet = data.get("user_wallet")
         if not (region and items and subtotal is not None and user_wallet):
             await msg.answer("Session error. Please /start again.")
-            step.pop(uid, None)
-            temp.pop(uid, None)
-            return
+            step.pop(uid, None); temp.pop(uid, None); return
 
-        # Save order
-        order_id = insert_order(
-            user_id=uid,
-            region=region,
-            products_csv=items,
-            total=subtotal,
-            user_wallet=user_wallet,
-            shipping=shipping
-        )
+        order_id = insert_order(uid, region, items, subtotal, user_wallet, shipping)
 
-        # Notify user
         await msg.answer(
             f"✅ Order *#{order_id}* received.\nStatus: *Pending*\n\n"
             "We’ll notify you when status changes.",
             reply_markup=main_menu_kb()
         )
 
-        # Notify admin group
-        await bot.send_message(
-            ADMIN_GROUP_ID,
-            f"🚨 *New Order* [#{order_id}]\n"
-            f"User: `{uid}`\n"
-            f"Region: {region}\n"
-            f"Items: {items}\n"
-            f"Total: ${subtotal} USDT\n"
-            f"Sender wallet: `{user_wallet}`\n"
-            f"Shipping:\n{shipping}\n\n"
-            f"_Set status with:_ `/setstatus {order_id} <pending|paid|shipped|delivered|canceled>`",
-        )
+        row = get_order(order_id)
+        await bot.send_message(ADMIN_GROUP_ID, order_card_text(row), reply_markup=admin_status_kb(order_id))
 
-        # cleanup session
         carts[uid] = []
-        step.pop(uid, None)
-        temp.pop(uid, None)
+        step.pop(uid, None); temp.pop(uid, None)
         return
 
-# =========================
-# Admin-group commands
-# =========================
+# ------------- Admin area -----------
 def is_admin_group(message: types.Message) -> bool:
     return message.chat.type in ("group", "supergroup") and message.chat.id == ADMIN_GROUP_ID
+
+@dp.callback_query_handler(lambda c: c.data.startswith("st:"))
+async def cb_set_status(call: types.CallbackQuery):
+    if call.message.chat.id != ADMIN_GROUP_ID:
+        await call.answer("Not allowed here.", show_alert=True); return
+
+    _, oid_str, status = call.data.split(":")
+    try:
+        oid = int(oid_str)
+    except ValueError:
+        await call.answer("Bad order id.", show_alert=True); return
+    status = status.lower()
+    if status not in ORDER_STATUSES:
+        await call.answer("Bad status.", show_alert=True); return
+
+    changed = update_order_status(oid, status)
+    if not changed:
+        await call.answer("Order not found.", show_alert=True); return
+
+    row = get_order(oid)
+    try:
+        await call.message.edit_text(order_card_text(row), reply_markup=admin_status_kb(oid))
+    except Exception:
+        await bot.send_message(ADMIN_GROUP_ID, order_card_text(row), reply_markup=admin_status_kb(oid))
+
+    _, user_id, *_ = row
+    try:
+        await bot.send_message(user_id, f"📦 Update for order *#{oid}*: *{status.title()}*")
+    except Exception:
+        pass
+
+    await call.answer(f"Updated to {status.title()}")
 
 @dp.message_handler(commands=["setstatus"])
 async def setstatus_cmd(msg: types.Message):
     if not is_admin_group(msg):
         return
-    parts = msg.get_args().split()
-    if len(parts) != 2:
-        await msg.reply("Usage: `/setstatus <order_id> <pending|paid|shipped|delivered|canceled>`", parse_mode="Markdown")
-        return
-    try:
-        order_id = int(parts[0])
-    except ValueError:
-        await msg.reply("Order id must be a number.")
-        return
-    new_status = parts[1].lower()
+    args = msg.get_args().strip()
+    order_id = None; new_status = None
+
+    ORDER_ID_RE = re.compile(r"#(\d+)")
+    if args:
+        parts = args.split(maxsplit=1)
+        if len(parts) == 2 and parts[0].isdigit():
+            order_id = int(parts[0]); new_status = parts[1].lower()
+        elif len(parts) == 1 and msg.reply_to_message:
+            src = (msg.reply_to_message.text or "") + (msg.reply_to_message.caption or "")
+            m = ORDER_ID_RE.search(src)
+            if m: order_id = int(m.group(1)); new_status = parts[0].lower()
+
+    if not order_id or not new_status:
+        await msg.reply(
+            "Usage:\n`/setstatus <order_id> <pending|paid|shipped|delivered|canceled>`\n"
+            "or reply to the order post with: `/setstatus <status>`",
+            parse_mode="Markdown"
+        ); return
+
     if new_status not in ORDER_STATUSES:
-        await msg.reply(f"Invalid status. Choose one of: {', '.join(sorted(ORDER_STATUSES))}")
-        return
+        await msg.reply(f"Invalid status. Use: {', '.join(sorted(ORDER_STATUSES))}"); return
 
     changed = update_order_status(order_id, new_status)
     if not changed:
-        await msg.reply(f"Order #{order_id} not found.")
-        return
+        await msg.reply(f"Order #{order_id} not found."); return
 
-    await msg.reply(f"✅ Order #{order_id} updated → *{new_status.title()}*", parse_mode="Markdown")
+    row = get_order(order_id)
+    try:
+        await msg.reply(f"✅ Order #{order_id} → *{new_status.title()}*")
+        if msg.reply_to_message:
+            try:
+                await msg.reply_to_message.edit_text(order_card_text(row), reply_markup=admin_status_kb(order_id))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    # Try notifying the user about the update
-    # fetch user_id
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM orders WHERE id=?", (order_id,))
-        row = c.fetchone()
-    if row:
-        user_id = row[0]
-        try:
-            await bot.send_message(user_id, f"📦 Update for order *#{order_id}*: *{new_status.title()}*", parse_mode="Markdown")
-        except Exception:
-            # user might have blocked the bot or never started it
-            await msg.reply("FYI: Could not notify user (not reachable).")
+    _, user_id, *_ = row
+    try:
+        await bot.send_message(user_id, f"📦 Update for order *#{order_id}*: *{new_status.title()}*")
+    except Exception:
+        await msg.reply("FYI: Could not notify user (not reachable).")
 
 @dp.message_handler(commands=["reply"])
 async def reply_cmd(msg: types.Message):
     if not is_admin_group(msg):
         return
-    # Syntax: /reply <msg_id> <text...>
     args = msg.get_args()
     if not args:
-        await msg.reply("Usage: `/reply <msg_id> <your message>`", parse_mode="Markdown")
-        return
+        await msg.reply("Usage: `/reply <msg_id> <your message>`", parse_mode="Markdown"); return
     parts = args.split(maxsplit=1)
     if len(parts) < 2:
-        await msg.reply("Include both message id and text.")
-        return
+        await msg.reply("Include both message id and text."); return
     try:
         msg_id = int(parts[0])
     except ValueError:
-        await msg.reply("Message id must be a number.")
-        return
+        await msg.reply("Message id must be a number."); return
     reply_text = parts[1]
 
     rec = get_message(msg_id)
     if not rec:
-        await msg.reply(f"Message MSG-{msg_id} not found.")
-        return
-    _, user_id, orig_text, status, created_at = rec
+        await msg.reply(f"Message MSG-{msg_id} not found."); return
+    _, user_id, _, _, _ = rec
 
-    # Send reply to user
     try:
-        await bot.send_message(user_id, f"📩 *Reply from Team:*\n{reply_text}", parse_mode="Markdown")
+        await bot.send_message(user_id, f"📩 *Reply from Team:*\n{reply_text}")
         mark_message_replied(msg_id)
-        await msg.reply(f"✅ Sent reply to user `{user_id}` for MSG-{msg_id}", parse_mode="Markdown")
+        await msg.reply(f"✅ Sent reply to user `{user_id}` for MSG-{msg_id}")
     except Exception as e:
         await msg.reply(f"Could not send reply to user `{user_id}`. Error: {e}")
+
+@dp.message_handler(commands=["reload_eu"])
+async def reload_eu_cmd(msg: types.Message):
+    if not is_admin_group(msg):
+        return
+    count = load_eu_catalogue()
+    if count:
+        await msg.reply(f"EU pricelist reloaded. Items: {count}")
+    else:
+        await msg.reply("Failed to load EU pricelist. Check EU_PRICELIST_PATH or EU_PRICELIST_CSV_URL.")
 
 @dp.message_handler(commands=["helpadmin"])
 async def helpadmin_cmd(msg: types.Message):
     if not is_admin_group(msg):
         return
     await msg.reply(
-        "Admin commands:\n"
+        "Admin controls:\n"
+        "• Inline buttons on order cards (Paid/Shipped/Delivered/Pending/Cancel)\n"
         "• `/setstatus <order_id> <pending|paid|shipped|delivered|canceled>`\n"
-        "• `/reply <msg_id> <text>`\n",
+        "• Reply to order card: `/setstatus <status>`\n"
+        "• `/reply <msg_id> <text>` to answer Contact Team tickets\n"
+        "• `/reload_eu` to refresh EU catalogue from file/URL\n",
         parse_mode="Markdown"
     )
 
-# =========================
-# Bootstrap
-# =========================
+@dp.message_handler(commands=["chatid"])
+async def chatid(msg: types.Message):
+    await msg.reply(f"Chat ID: {msg.chat.id}")
+
+# --------------- Run ----------------
 if __name__ == "__main__":
     init_db()
+    load_eu_catalogue()  # preload EU list on boot
     executor.start_polling(dp, skip_updates=True)
