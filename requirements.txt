@@ -1,1 +1,4 @@
 python-telegram-bot==20.6
+aiogram==2.25.1
+python-dotenv
+web3   # if you use blockchain later
