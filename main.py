@@ -184,106 +184,55 @@ def load_eu_from_local(path: str) -> int:
         return 0
     ext = os.path.splitext(path)[1].lower()
 
+    # CSV path (if you switch later)
     if ext == ".csv":
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return load_eu_from_csv_text(f.read())
 
+    # XLS/XLSX path (your current case)
     elif ext in (".xlsx", ".xls"):
         if openpyxl is None:
             return 0
 
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
+        rows_iter = ws.iter_rows(values_only=True)
+
+        items = {}
+        next_id = 1
+
+        # --- Skip the first row (your sheet's "New products" title row) ---
+        try:
+            next(rows_iter)
+        except StopIteration:
             return 0
 
-        headers = [str(h or "").strip().lower() for h in rows[0]]
-
-        # --- choose name column ---
-        try:
-            name_idx = headers.index("name")
-        except ValueError:
-            name_idx = 0  # your sheet puts name in column A, row2+
-
-        # --- choose price column (header or heuristic) ---
-        price_idx = None
-        for key in ("price", "cost", "amount"):
-            if key in headers:
-                price_idx = headers.index(key); break
-        if price_idx is None:
-            max_hits = -1; best_col = None
-            col_count = max(len(r) for r in rows)
-            sample = rows[1: min(len(rows), 30)]
-            for j in range(col_count):
-                hits = 0
-                for r in sample:
-                    s = str((r[j] if j < len(r) else "") or "")
-                    if any(ch.isdigit() for ch in s):
-                        try:
-                            _ = parse_price(s)
-                            if s.strip(): hits += 1
-                        except Exception:
-                            pass
-                if hits > max_hits:
-                    max_hits = hits; best_col = j
-            price_idx = best_col if best_col is not None else 1  # column B in your sheet
-
-        # --- choose stock column (header or heuristic looking for "stock") ---
-        stock_idx = None
-        if "stock" in headers:
-            stock_idx = headers.index("stock")
-        else:
-            col_count = max(len(r) for r in rows)
-            sample = rows[1: min(len(rows), 50)]
-            best_hits = -1; best_col = None
-            for j in range(col_count):
-                hits = 0
-                for r in sample:
-                    val = str((r[j] if j < len(r) else "") or "").lower()
-                    if "stock" in val:
-                        hits += 1
-                if hits > best_hits:
-                    best_hits = hits; best_col = j
-            stock_idx = best_col  # may be None if truly absent
-
-        id_idx = headers.index("id") if "id" in headers else None
-
-        # --- build items ---
-        items, next_id = {}, 1
-        for r in rows[1:]:
+        # --- Force fixed mapping: ColA=name, ColB=price, ColC=stock ---
+        for r in rows_iter:
             if not r:
                 continue
-            # name
+
+            # Name (col A)
             name = ""
-            if name_idx is not None and name_idx < len(r) and r[name_idx] is not None:
-                name = str(r[name_idx]).strip()
+            if len(r) >= 1 and r[0] is not None:
+                name = str(r[0]).strip()
             if not name:
-                continue
+                continue  # ignore blank lines
 
-            # id
-            pid = None
-            if id_idx is not None and id_idx < len(r) and r[id_idx] is not None:
-                try:
-                    pid = int(str(r[id_idx]).split(".")[0])
-                except Exception:
-                    pid = None
-            if pid is None:
-                pid = next_id; next_id += 1
-
-            # price
+            # Price (col B)
             price_val = ""
-            if price_idx is not None and price_idx < len(r) and r[price_idx] is not None:
-                price_val = str(r[price_idx])
+            if len(r) >= 2 and r[1] is not None:
+                price_val = str(r[1]).strip()
             price = parse_price(price_val)
 
-            # stock
+            # Stock (col C)
             stock_val = ""
-            if stock_idx is not None and stock_idx < len(r) and r[stock_idx] is not None:
-                stock_val = str(r[stock_idx])
+            if len(r) >= 3 and r[2] is not None:
+                stock_val = str(r[2]).strip()
             stock = availability_label(stock_val)
 
-            items[pid] = {"name": name, "price": price, "stock": stock}
+            items[next_id] = {"name": name, "price": price, "stock": stock}
+            next_id += 1
 
         catalogues["EU"] = dict(sorted(items.items(), key=lambda kv: kv[0]))
         return len(items)
