@@ -1,9 +1,11 @@
-# Telegram shop bot:
+# Telegram shop bot (EU XLSX + stock + silent markup & shipping)
 # - Region selection (US/UK/EU) + catalogue (EU loads from local XLSX/CSV or CSV URL)
-# - Cart -> checkout -> ask sender wallet + shipping
+# - Shows stock (✅ In Stock / ❌ OOS); blocks OOS adds
+# - Cart -> checkout -> collects sender wallet + shipping
+# - Total the user sees: FINAL = round(sum(items) * 1.30 + 30, 2)
 # - Save orders in SQLite (status=Pending)
 # - Post order card to ADMIN_GROUP_ID with inline status buttons
-# - Admin: tap buttons or /setstatus; reply to tickets with /reply
+# - Admin: tap buttons or /setstatus; reply tickets with /reply
 # - /reload_eu to refresh EU list from file/URL
 # - Pagination for large catalogues
 
@@ -16,7 +18,7 @@ from contextlib import closing
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
-# Optional deps used conditionally
+# Optional deps (used only if present)
 try:
     import requests
 except Exception:
@@ -27,10 +29,11 @@ try:
 except Exception:
     openpyxl = None
 
+# ----------- Config / ENV -----------
 API_TOKEN = os.getenv("API_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))   # e.g. -1001234567890
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "YOUR_USDT_WALLET")
-EU_PRICELIST_CSV_URL = os.getenv("EU_PRICELIST_CSV_URL")  # optional
+EU_PRICELIST_CSV_URL = os.getenv("EU_PRICELIST_CSV_URL")  # optional fallback
 EU_PRICELIST_PATH = os.getenv("EU_PRICELIST_PATH")        # e.g. "eu_pricelist.xlsx" in repo
 
 if not API_TOKEN:
@@ -43,6 +46,11 @@ dp = Dispatcher(bot)
 
 DB_PATH = "orders.db"
 PAGE_SIZE = 10
+
+# Silent pricing knobs
+MARKUP_RATE = 0.30  # 30%
+SHIPPING_FEE = 30.0 # flat
+
 ORDER_STATUSES = {"pending", "paid", "shipped", "delivered", "canceled"}
 
 # ---------------- DB ----------------
@@ -55,7 +63,7 @@ def init_db():
             user_id INTEGER NOT NULL,
             region TEXT NOT NULL,
             products TEXT NOT NULL,
-            total REAL NOT NULL,
+            total REAL NOT NULL,                -- final charged total
             user_wallet TEXT,
             shipping TEXT,
             status TEXT NOT NULL DEFAULT 'Pending',
@@ -71,13 +79,13 @@ def init_db():
             replied_at TEXT
         )""")
 
-def insert_order(user_id, region, products_csv, total, user_wallet, shipping):
+def insert_order(user_id, region, products_csv, final_total, user_wallet, shipping):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         c = conn.cursor()
         c.execute("""
             INSERT INTO orders (user_id, region, products, total, user_wallet, shipping)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (user_id, region, products_csv, total, user_wallet, shipping))
+        """, (user_id, region, products_csv, final_total, user_wallet, shipping))
         return c.lastrowid
 
 def update_order_status(order_id, new_status):
@@ -126,17 +134,14 @@ def mark_message_replied(msg_id):
         return c.rowcount
 
 # ------------- Catalogue ------------
+# US/UK simple examples with stock defaulted In Stock
 catalogues = {
-    "US": {
-        1: {"name": "US Product 1", "price": 10.0},
-        2: {"name": "US Product 2", "price": 20.0},
-        3: {"name": "US Product 3", "price": 30.0},
-    },
-    "UK": {
-        1: {"name": "UK Product 1", "price": 12.0},
-        2: {"name": "UK Product 2", "price": 18.0},
-        3: {"name": "UK Product 3", "price": 28.0},
-    },
+    "US": {1: {"name": "US Product 1", "price": 10.0, "stock": "In Stock"},
+           2: {"name": "US Product 2", "price": 20.0, "stock": "In Stock"},
+           3: {"name": "US Product 3", "price": 30.0, "stock": "In Stock"}},
+    "UK": {1: {"name": "UK Product 1", "price": 12.0, "stock": "In Stock"},
+           2: {"name": "UK Product 2", "price": 18.0, "stock": "In Stock"},
+           3: {"name": "UK Product 3", "price": 28.0, "stock": "In Stock"}},
     "EU": {}  # loaded at boot /reload_eu
 }
 
@@ -147,6 +152,14 @@ def parse_price(val: str) -> float:
         return round(float(v), 2) if v else 0.0
     except Exception:
         return 0.0
+
+def availability_label(s: str) -> str:
+    s = (s or "").strip().lower()
+    if "out" in s:
+        return "Out Of Stock"
+    if "in" in s or "stock" in s:
+        return "In Stock"
+    return s.title() if s else "In Stock"
 
 def load_eu_from_csv_text(text: str) -> int:
     reader = csv.DictReader(StringIO(text))
@@ -161,7 +174,8 @@ def load_eu_from_csv_text(text: str) -> int:
         else:
             pid = next_id; next_id += 1
         price = parse_price(row.get("price") or row.get("Price") or "0")
-        items[pid] = {"name": name, "price": price}
+        stock = availability_label(row.get("stock") or row.get("Stock") or "")
+        items[pid] = {"name": name, "price": price, "stock": stock}
     catalogues["EU"] = dict(sorted(items.items(), key=lambda kv: kv[0]))
     return len(items)
 
@@ -169,52 +183,111 @@ def load_eu_from_local(path: str) -> int:
     if not os.path.exists(path):
         return 0
     ext = os.path.splitext(path)[1].lower()
+
     if ext == ".csv":
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return load_eu_from_csv_text(f.read())
+
     elif ext in (".xlsx", ".xls"):
         if openpyxl is None:
             return 0
+
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         ws = wb.active
-        # build header map
         rows = list(ws.iter_rows(values_only=True))
         if not rows:
             return 0
+
         headers = [str(h or "").strip().lower() for h in rows[0]]
+
+        # --- choose name column ---
         try:
             name_idx = headers.index("name")
         except ValueError:
-            # heuristic: take the first non-empty column as name
-            name_idx = 0
+            name_idx = 0  # your sheet puts name in column A, row2+
+
+        # --- choose price column (header or heuristic) ---
         price_idx = None
         for key in ("price", "cost", "amount"):
             if key in headers:
                 price_idx = headers.index(key); break
+        if price_idx is None:
+            max_hits = -1; best_col = None
+            col_count = max(len(r) for r in rows)
+            sample = rows[1: min(len(rows), 30)]
+            for j in range(col_count):
+                hits = 0
+                for r in sample:
+                    s = str((r[j] if j < len(r) else "") or "")
+                    if any(ch.isdigit() for ch in s):
+                        try:
+                            _ = parse_price(s)
+                            if s.strip(): hits += 1
+                        except Exception:
+                            pass
+                if hits > max_hits:
+                    max_hits = hits; best_col = j
+            price_idx = best_col if best_col is not None else 1  # column B in your sheet
+
+        # --- choose stock column (header or heuristic looking for "stock") ---
+        stock_idx = None
+        if "stock" in headers:
+            stock_idx = headers.index("stock")
+        else:
+            col_count = max(len(r) for r in rows)
+            sample = rows[1: min(len(rows), 50)]
+            best_hits = -1; best_col = None
+            for j in range(col_count):
+                hits = 0
+                for r in sample:
+                    val = str((r[j] if j < len(r) else "") or "").lower()
+                    if "stock" in val:
+                        hits += 1
+                if hits > best_hits:
+                    best_hits = hits; best_col = j
+            stock_idx = best_col  # may be None if truly absent
+
         id_idx = headers.index("id") if "id" in headers else None
 
+        # --- build items ---
         items, next_id = {}, 1
         for r in rows[1:]:
-            if r is None:
+            if not r:
                 continue
-            name = str(r[name_idx]).strip() if name_idx is not None and name_idx < len(r) and r[name_idx] is not None else ""
+            # name
+            name = ""
+            if name_idx is not None and name_idx < len(r) and r[name_idx] is not None:
+                name = str(r[name_idx]).strip()
             if not name:
                 continue
+
+            # id
             pid = None
-            if id_idx is not None and id_idx < len(r):
+            if id_idx is not None and id_idx < len(r) and r[id_idx] is not None:
                 try:
                     pid = int(str(r[id_idx]).split(".")[0])
                 except Exception:
                     pid = None
             if pid is None:
                 pid = next_id; next_id += 1
+
+            # price
             price_val = ""
             if price_idx is not None and price_idx < len(r) and r[price_idx] is not None:
                 price_val = str(r[price_idx])
             price = parse_price(price_val)
-            items[pid] = {"name": name, "price": price}
+
+            # stock
+            stock_val = ""
+            if stock_idx is not None and stock_idx < len(r) and r[stock_idx] is not None:
+                stock_val = str(r[stock_idx])
+            stock = availability_label(stock_val)
+
+            items[pid] = {"name": name, "price": price, "stock": stock}
+
         catalogues["EU"] = dict(sorted(items.items(), key=lambda kv: kv[0]))
         return len(items)
+
     else:
         return 0
 
@@ -272,7 +345,9 @@ def products_kb(region, page: int):
 
     for pid in page_slice:
         info = items[pid]
-        label = f"{pid}. {info['name']} (${info['price']})"
+        in_stock = "out" not in info.get("stock", "").lower()
+        stock_tag = "✅ In Stock" if in_stock else "❌ OOS"
+        label = f"{pid}. {info['name']} ({stock_tag}) — ${info['price']}"
         kb.add(types.InlineKeyboardButton(label, callback_data=f"add_{pid}"))
 
     nav = []
@@ -371,11 +446,19 @@ async def add_item(call: types.CallbackQuery):
     if not region:
         await call.answer("Choose region first", show_alert=True); return
     pid = int(call.data.split("_")[1])
-    if pid not in catalogues.get(region, {}):
+
+    # Validate product exists & stock
+    item = catalogues.get(region, {}).get(pid)
+    if not item:
         await call.answer("Item not found on this page.", show_alert=True); return
+    in_stock = "out" not in item.get("stock", "").lower()
+    if not in_stock:
+        await call.answer("That item is currently out of stock.", show_alert=True); return
+
     carts.setdefault(uid, []).append(pid)
-    subtotal = sum(catalogues[region][i]["price"] for i in carts[uid])
-    await call.answer(f"Added. Subtotal: ${subtotal}")
+    # show *base* subtotal while browsing; final total is shown at checkout
+    base_subtotal = sum(catalogues[region][i]["price"] for i in carts[uid])
+    await call.answer(f"Added. Subtotal: ${round(base_subtotal,2)}")
 
 @dp.callback_query_handler(lambda c: c.data == "checkout")
 async def checkout(call: types.CallbackQuery):
@@ -385,14 +468,21 @@ async def checkout(call: types.CallbackQuery):
     if not region or not cart:
         await call.answer("No items selected.", show_alert=True); return
 
-    subtotal = sum(catalogues[region][i]["price"] for i in cart)
+    base_sum = sum(catalogues[region][i]["price"] for i in cart)
+    final_total = round(base_sum * (1.0 + MARKUP_RATE) + SHIPPING_FEE, 2)
     items = ", ".join(str(i) for i in cart)
-    temp[uid] = {"region": region, "items": items, "subtotal": round(subtotal, 2)}
+
+    temp[uid] = {
+        "region": region,
+        "items": items,
+        "base_sum": round(base_sum, 2),
+        "final_total": final_total
+    }
     step[uid] = "awaiting_wallet"
 
     await call.message.edit_text(
         f"Your order ({region}): {items}\n"
-        f"Total: *${round(subtotal,2)} USDT*\n\n"
+        f"Total: *${final_total} USDT*\n\n"
         f"Send payment to:\n`{WALLET_ADDRESS}`\n\n"
         "Reply with the *crypto address you will send from*."
     )
@@ -422,12 +512,13 @@ async def collect_steps(msg: types.Message):
         shipping = msg.text.strip()
         data = temp.get(uid, {})
         region = data.get("region"); items = data.get("items")
-        subtotal = data.get("subtotal"); user_wallet = data.get("user_wallet")
-        if not (region and items and subtotal is not None and user_wallet):
+        base_sum = data.get("base_sum"); final_total = data.get("final_total")
+        user_wallet = data.get("user_wallet")
+        if not (region and items and base_sum is not None and final_total is not None and user_wallet):
             await msg.answer("Session error. Please /start again.")
             step.pop(uid, None); temp.pop(uid, None); return
 
-        order_id = insert_order(uid, region, items, subtotal, user_wallet, shipping)
+        order_id = insert_order(uid, region, items, final_total, user_wallet, shipping)
 
         await msg.answer(
             f"✅ Order *#{order_id}* received.\nStatus: *Pending*\n\n"
